@@ -1,0 +1,273 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\usepackage{datetime2}
+\usepackage{xparse}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{minted}
+\usepackage{float}
+
+\geometry{
+  a4paper,
+  total={170mm,257mm},
+  left=20mm,
+  top=20mm,
+}
+
+\usepackage{graphicx}
+\usepackage{titling}
+
+\title{Laporan Simulasi Robot Sepakbola}
+
+    
+\date{29 April 2026}
+
+\usepackage{fancyhdr}
+\fancypagestyle{plain}{%
+    \fancyhf{}
+    \fancyfoot[R]{}
+    \fancyfoot[L]{}
+    \fancyhead[L]{\includegraphics[width=2cm]{ITS_pojok.pdf}}
+    \fancyhead[R]{\DTMnow}
+}
+\makeatletter
+\def\@maketitle{%
+  \newpage
+  \null
+  \vskip 1em%
+  \begin{center}%
+  \let \footnote \thanks
+    {\LARGE \@title \par}%
+    \vskip 1em%
+  \end{center}%
+  \par
+  \vskip 1em}
+\makeatother
+
+\begin{document}
+
+\maketitle
+
+\noindent\begin{tabular}{@{}ll}
+    Author(s): & Muhammad Bari Akmal\\
+    Teacher:   & Muhammad Qomaruz Zaman, S.T., M.T., Ph.D.\\
+    Class name: & Sistem Robot Otonom\\
+    YouTube video link: & \url{https://youtu.be/WxBTJHcZ4Bk} \\
+    GitHub link: & \url{https://github.com/Drimal-835/Otomation-of-Robotic-System}
+\end{tabular}
+\vspace{2cm}
+
+% ─────────────────────────────────────────────
+\section{Pendahuluan}
+
+Pada tugas ini digunakan simulasi pertandingan sepakbola sederhana yang dijalankan
+di dalam lingkungan \textbf{CoppeliaSim} dengan antarmuka \textit{ZMQ Remote API}.
+Terdapat tiga robot otonom yang berperan masing-masing sebagai \textit{Striker},
+\textit{Goalkeeper}, dan \textit{Participant} (pemain patroli). Kode python
+\texttt{robot\_sepakbola\_v4.py} mengatur perilaku seluruh agen tersebut secara
+bersamaan dalam satu loop simulasi.
+
+% ─────────────────────────────────────────────
+\section{Tujuan}
+
+\begin{enumerate}
+    \item Mengimplementasikan sistem multi-robot otonom pada simulasi CoppeliaSim
+          menggunakan Python dan ZMQ Remote API.
+    \item Menerapkan mesin keadaan (\textit{finite state machine}) pada robot
+          \textit{Striker} agar mampu merencanakan dan mengeksekusi tendangan ke
+          gawang lawan secara otomatis.
+    \item Mengimplementasikan perilaku penjaga gawang (\textit{Goalkeeper}) yang
+          reaktif terhadap posisi bola.
+    \item Menerapkan perilaku patroli sederhana pada robot \textit{Participant}
+          sebagai penghalang dinamis di lapangan.
+    \item Mengelola siklus reset otomatis permainan menggunakan komponen
+          \texttt{BallMonitor} berbasis kecepatan dan jarak bola.
+\end{enumerate}
+
+% ─────────────────────────────────────────────
+\section{Struktur dan Fungsi Kode}
+
+\subsection{Konstanta Global}
+
+Bagian awal kode mendefinisikan seluruh konstanta yang digunakan sepanjang
+simulasi, antara lain nama objek di CoppeliaSim, parameter kecepatan motor,
+dan parameter geometri lapangan.
+
+\begin{minted}[frame=lines, framesep=2mm, linenos]{python}
+OBJ_BALL     = "/Bola_Merah"
+OBJ_ROBOT_GK = "/Robot_Pemain"
+OBJ_ROBOT_ST = "/Robot_Lawan_01"
+OBJ_ROBOT_PR = "/Robot_Lawan_02"
+OBJ_GOAL     = "/Gwang_Kuning"
+
+NORMAL_SPEED    = 4.0
+SPRINT_SPEED    = 12.0
+KICK_VEL        = 4.5
+SETUP_DIST      = 1.00
+STOP_OFFSET     = 0.50
+KICK_RADIUS     = 0.20
+GOAL_WIDTH_FB   = 0.80
+GK_DEF_DIST     = 0.50
+GK_SLIDE_MAX    = 0.65
+FIELD_Y_MIN     = -1.20
+FIELD_Y_MAX     =  1.20
+RESET_DELAY     = 7.0
+BALL_MOVE_THRESH = 0.05
+BALL_STILL_DIST  = 0.10
+\end{minted}
+
+\subsection{Kelas \texttt{Bot} — Kelas Dasar Robot}
+
+Kelas \texttt{Bot} adalah kelas induk yang diwarisi oleh seluruh agen robot.
+Kelas ini menyediakan antarmuka dasar untuk membaca posisi dan orientasi robot,
+mengontrol motor roda, serta melakukan navigasi menuju titik tujuan.
+
+Fungsi kunci pada kelas ini adalah \texttt{go()}, yang mengimplementasikan
+kendali gerak \textit{proportional} — robot akan berputar dahulu jika sudut
+kesalahan (\textit{angular error}) terlalu besar, kemudian maju dengan kecepatan
+linear yang dikurangi saat mendekati target.
+
+\begin{minted}[frame=lines, framesep=2mm, linenos]{python}
+def go(self, tx, ty, spd=NORMAL_SPEED, thr=0.08):
+    p      = self.pos()
+    dx, dy = tx - p[0], ty - p[1]
+    dist   = math.sqrt(dx*dx + dy*dy)
+    if dist < thr:
+        self.stop()
+        return True
+    target_yaw = math.atan2(dy, dx)
+    ang_err    = norm_ang(target_yaw - self.yaw())
+    v_ang = clamp(5.0 * ang_err, -spd, spd)
+    if abs(ang_err) > 0.5:
+        self.drive(-v_ang * 0.6, v_ang * 0.6)
+    else:
+        v_lin = spd * clamp(dist / 0.30, 0.1, 1.0)
+        v_lin *= (1.0 - abs(ang_err) / 1.5)
+        v_lin  = clamp(v_lin, 0.3, spd)
+        self.drive(clamp(v_lin - v_ang, -spd, spd),
+                   clamp(v_lin + v_ang, -spd, spd))
+    return False
+\end{minted}
+
+\subsection{Kelas \texttt{Goalkeeper} — Penjaga Gawang}
+
+Kelas \texttt{Goalkeeper} mewarisi \texttt{Bot} dan bertugas mempertahankan
+gawang. Pada setiap iterasi, \textit{goalkeeper} menghitung posisi Y ideal
+berdasarkan posisi bola (dengan faktor pembobot 0.4 agar tidak terlalu agresif),
+lalu bergerak menuju posisi defensifnya. Jika sudah pada posisi yang tepat,
+robot akan menghadap ke arah bola.
+
+\begin{minted}[frame=lines, framesep=2mm, linenos]{python}
+def update(self, ball_pos):
+    bx, by  = ball_pos[0], ball_pos[1]
+    ideal_y = self.goal_cy + 0.40 * (by - self.goal_cy)
+    ideal_y = clamp(ideal_y, -GK_SLIDE_MAX, GK_SLIDE_MAX)
+    p       = self.pos()
+    dx = self.def_x - p[0]
+    dy = ideal_y    - p[1]
+    dist = math.sqrt(dx*dx + dy*dy)
+    if dist > 0.06:
+        self.go(self.def_x, ideal_y, spd=SPRINT_SPEED, thr=0.06)
+    else:
+        self.face_only(bx, by, thr=0.10)
+\end{minted}
+
+\subsection{Kelas \texttt{Striker} — Penyerang}
+
+Kelas \texttt{Striker} adalah agen paling kompleks dalam simulasi ini.
+Robot ini menggunakan \textit{finite state machine} (FSM) dengan empat keadaan:
+
+\begin{center}
+\begin{tabular}{@{}lp{10cm}@{}}
+\toprule
+\textbf{State} & \textbf{Deskripsi} \\
+\midrule
+\texttt{GOTO\_SETUP}  & Robot bergerak ke titik ancang-ancang di belakang bola, sejajar dengan arah tendangan yang telah direncanakan. \\
+\texttt{FACE\_TARGET} & Robot berhenti dan memutar badan menghadap titik target di gawang. \\
+\texttt{CHARGE}       & Robot berlari kencang menuju bola, menendang saat radius \texttt{KICK\_RADIUS} tercapai, lalu terus ke titik \texttt{stop\_pt}. \\
+\texttt{WAIT\_RESET}  & Robot menunggu \texttt{BallMonitor} memicu reset siklus berikutnya. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Metode \texttt{\_plan()} menghasilkan titik target secara acak dalam lebar
+gawang setiap siklus, sehingga arah tendangan bervariasi.
+
+\subsection{Kelas \texttt{BallMonitor} — Pemantau Bola}
+
+\texttt{BallMonitor} bertugas mendeteksi apakah bola sudah bergerak jauh dari
+posisi awal, lalu memicu reset setelah \texttt{RESET\_DELAY} detik berlalu.
+Kelas ini menggunakan estimasi kecepatan bola berdasarkan selisih posisi dan
+selisih waktu antar iterasi.
+
+\begin{minted}[frame=lines, framesep=2mm, linenos]{python}
+def update(self, ball_pos):
+    spd        = self._ball_velocity(ball_pos)
+    dist_init  = d2(ball_pos[:2], self.ball_init[:2])
+    if self.state == self.STILL:
+        if spd > BALL_MOVE_THRESH and dist_init > BALL_STILL_DIST:
+            self.state     = self.MOVING
+            self.move_time = time.time()
+    elif self.state == self.MOVING:
+        elapsed = time.time() - self.move_time
+        if elapsed >= RESET_DELAY:
+            self.state = self.WAITING
+            return True   # trigger reset
+    return False
+\end{minted}
+
+\subsection{Kelas \texttt{Participant} — Robot Patroli}
+
+\texttt{Participant} bergerak bolak-balik sepanjang sumbu Y di posisi X yang
+berada di antara posisi awal bola dan gawang. Perilaku ini menciptakan penghalang
+dinamis yang membuat skenario simulasi lebih realistis.
+
+\subsection{Fungsi \texttt{main()}}
+
+Fungsi utama menginisialisasi koneksi ke CoppeliaSim, membuat seluruh objek
+agen, lalu menjalankan loop simulasi pada laju sekitar 62.5 Hz
+(\texttt{time.sleep(0.016)}). Setiap 60 iterasi, status seluruh agen dicetak
+ke terminal untuk keperluan pemantauan.
+
+% ─────────────────────────────────────────────
+\section{Alur Kerja Keseluruhan Sistem}
+
+Berikut adalah alur kerja sistem secara keseluruhan dalam satu siklus permainan:
+
+\begin{enumerate}
+    \item \textbf{Inisialisasi:} Koneksi ke CoppeliaSim dibuka, posisi awal
+          bola dan gawang dibaca, seluruh agen dibuat dan \textit{Striker}
+          di-teleport ke titik setup.
+    \item \textbf{Loop Simulasi:}
+    \begin{enumerate}
+        \item Posisi bola dibaca setiap iterasi.
+        \item \texttt{BallMonitor} memperbarui status gerakan bola.
+        \item \texttt{Striker} mengeksekusi FSM: ancang-ancang $\to$ arahkan
+              badan $\to$ lari dan tendang $\to$ tunggu reset.
+        \item \texttt{Goalkeeper} menyesuaikan posisi defensif berdasarkan
+              posisi bola terkini.
+        \item \texttt{Participant} melanjutkan patroli bolak-balik.
+    \end{enumerate}
+    \item \textbf{Reset Siklus:} Setelah \texttt{RESET\_DELAY} detik sejak
+          bola bergerak, \texttt{BallMonitor} memicu \texttt{do\_reset()} pada
+          \textit{Striker} — bola dan robot dikembalikan ke posisi awal, rencana
+          tendangan baru dibuat secara acak, dan siklus dimulai ulang.
+\end{enumerate}
+
+% ─────────────────────────────────────────────
+\section{Kesimpulan}
+
+Kode \texttt{robot\_sepakbola\_v4.py} berhasil mengimplementasikan sistem
+multi-robot otonom berbasis \textit{finite state machine} dan kendali gerak
+proporsional pada lingkungan simulasi CoppeliaSim. Setiap kelas dirancang
+dengan tanggung jawab yang jelas dan terpisah: \texttt{Bot} sebagai fondasi
+gerak, \texttt{Striker} sebagai agen penyerang dengan perencanaan tendangan acak,
+\texttt{Goalkeeper} sebagai agen reaktif berbasis posisi bola, \texttt{Participant}
+sebagai penghalang dinamis, dan \texttt{BallMonitor} sebagai pengawas siklus
+permainan. Arsitektur ini modular dan mudah dikembangkan, misalnya dengan
+menambahkan lebih banyak agen atau strategi permainan yang lebih kompleks.
+
+\end{document}
